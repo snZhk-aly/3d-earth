@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>3D Earth</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; height: 100vh; font-family: 'Courier New', monospace; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; top: 15px; left: 15px;
+    color: #7fd4ff; font-size: 12px; letter-spacing: 1px;
+    background: rgba(0,10,20,0.6); padding: 10px 14px;
+    border-radius: 8px; border: 1px solid rgba(100,200,255,0.3);
+    z-index: 10; pointer-events: none; line-height: 1.6;
+  }
+  #hud b { color: #fff; }
+  #hint {
+    position: fixed; bottom: 15px; left: 50%; transform: translateX(-50%);
+    color: rgba(150,210,255,0.5); font-size: 11px; letter-spacing: 2px;
+    z-index: 10; pointer-events: none;
+  }
+  #loader {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: #000; color: #7fd4ff; font-size: 14px; letter-spacing: 3px;
+    z-index: 100; transition: opacity 0.5s;
+  }
+</style>
+</head>
+<body>
+
+<div id="loader">ЗАГРУЗКА ЗЕМЛИ...</div>
+<div id="hud">
+  <div>ШИРОТА: <b id="lat">0.00°</b></div>
+  <div>ДОЛГОТА: <b id="lon">0.00°</b></div>
+  <div>ЗУМ: <b id="zoom">2.5</b></div>
+  <div>ВРЕМЯ: <b id="clock">--:--</b></div>
+</div>
+<div id="hint">ЛКМ — ВРАЩАТЬ · КОЛЕСО — ЗУМ · ДВОЙНОЙ КЛИК — ПЕРЕЛЕТ</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ============================================================
+// 3D ЗЕМЛЯ
+// ============================================================
+
+const loaderEl = document.getElementById('loader');
+const latEl = document.getElementById('lat');
+const lonEl = document.getElementById('lon');
+const zoomEl = document.getElementById('zoom');
+const clockEl = document.getElementById('clock');
+
+let scene, camera, renderer;
+let earth, clouds, atmosphere, starField;
+let sunLight;
+let isDragging = false;
+let previousMouse = { x: 0, y: 0 };
+let rotationVelocity = { x: 0, y: 0.001 };
+let targetZoom = 2.5;
+let currentZoom = 2.5;
+
+// ============================================================
+// ИНИЦИАЛИЗАЦИЯ
+// ============================================================
+function init() {
+  scene = new THREE.Scene();
+
+  camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 2000);
+  camera.position.set(0, 0, 2.5);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  document.body.appendChild(renderer.domElement);
+
+  // Свет
+  sunLight = new THREE.DirectionalLight(0xffffff, 1.4);
+  sunLight.position.set(5, 2, 3);
+  scene.add(sunLight);
+
+  const ambientLight = new THREE.AmbientLight(0x334466, 0.6);
+  scene.add(ambientLight);
+
+  // Звёзды
+  createStars();
+
+  // Земля — грузим текстуру с CDN
+  const textureLoader = new THREE.TextureLoader();
+  textureLoader.setCrossOrigin('anonymous');
+
+  // Текстура Земли (реальная карта мира от NASA Blue Marble, обрезанная для сферы)
+  const earthTextureUrl = 'https://unpkg.com/three-globe/example/img/earth-blue-marble.jpg';
+  const bumpTextureUrl = 'https://unpkg.com/three-globe/example/img/earth-topology.png';
+  const cloudTextureUrl = 'https://unpkg.com/three-globe/example/img/earth-clouds.png';
+
+  const geometry = new THREE.SphereGeometry(1, 96, 96);
+
+  const earthMaterial = new THREE.MeshPhongMaterial({
+    map: textureLoader.load(earthTextureUrl, () => {
+      loaderEl.style.opacity = '0';
+      setTimeout(() => loaderEl.remove(), 600);
+    }),
+    bumpMap: textureLoader.load(bumpTextureUrl),
+    bumpScale: 0.02,
+    specularMap: textureLoader.load(earthTextureUrl),
+    specular: new THREE.Color('grey'),
+    shininess: 8
+  });
+
+  earth = new THREE.Mesh(geometry, earthMaterial);
+  earth.rotation.y = -Math.PI / 2;
+  scene.add(earth);
+
+  // Облака
+  const cloudMaterial = new THREE.MeshPhongMaterial({
+    map: textureLoader.load(cloudTextureUrl),
+    transparent: true,
+    opacity: 0.4,
+    depthWrite: false
+  });
+  clouds = new THREE.Mesh(new THREE.SphereGeometry(1.008, 96, 96), cloudMaterial);
+  clouds.rotation.y = -Math.PI / 2;
+  scene.add(clouds);
+
+  // Атмосфера (свечение вокруг)
+  const atmosphereMaterial = new THREE.ShaderMaterial({
+    vertexShader: `
+      varying vec3 vNormal;
+      void main() {
+        vNormal = normalize(normalMatrix * normal);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      varying vec3 vNormal;
+      void main() {
+        float intensity = pow(0.7 - dot(vNormal, vec3(0, 0, 1.0)), 3.0);
+        gl_FragColor = vec4(0.3, 0.6, 1.0, 1.0) * intensity;
+      }
+    `,
+    blending: THREE.AdditiveBlending,
+    side: THREE.BackSide,
+    transparent: true
+  });
+  atmosphere = new THREE.Mesh(new THREE.SphereGeometry(1.15, 64, 64), atmosphereMaterial);
+  scene.add(atmosphere);
+
+  // События
+  window.addEventListener('resize', onResize);
+  renderer.domElement.addEventListener('mousedown', onMouseDown);
+  renderer.domElement.addEventListener('mousemove', onMouseMove);
+  renderer.domElement.addEventListener('mouseup', onMouseUp);
+  renderer.domElement.addEventListener('mouseleave', onMouseUp);
+  renderer.domElement.addEventListener('wheel', onWheel, { passive: false });
+  renderer.domElement.addEventListener('dblclick', onDoubleClick);
+
+  // Touch
+  renderer.domElement.addEventListener('touchstart', onTouchStart, { passive: false });
+  renderer.domElement.addEventListener('touchmove', onTouchMove, { passive: false });
+  renderer.domElement.addEventListener('touchend', onTouchEnd);
+
+  animate();
+}
+
+// ============================================================
+// ЗВЁЗДЫ
+// ============================================================
+function createStars() {
+  const starGeometry = new THREE.BufferGeometry();
+  const starCount = 3000;
+  const positions = new Float32Array(starCount * 3);
+
+  for (let i = 0; i < starCount * 3; i += 3) {
+    const r = 200 + Math.random() * 300;
+    const theta = Math.random() * Math.PI * 2;
+    const phi = Math.acos(Math.random() * 2 - 1);
+    positions[i] = r * Math.sin(phi) * Math.cos(theta);
+    positions[i + 1] = r * Math.sin(phi) * Math.sin(theta);
+    positions[i + 2] = r * Math.cos(phi);
+  }
+
+  starGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+  const starMaterial = new THREE.PointsMaterial({
+    color: 0xffffff,
+    size: 0.7,
+    sizeAttenuation: true,
+    transparent: true,
+    opacity: 0.9
+  });
+
+  starField = new THREE.Points(starGeometry, starMaterial);
+  scene.add(starField);
+}
+
+// ============================================================
+// УПРАВЛЕНИЕ
+// ============================================================
+function onMouseDown(e) {
+  isDragging = true;
+  previousMouse = { x: e.clientX, y: e.clientY };
+  rotationVelocity = { x: 0, y: 0 };
+}
+
+function onMouseMove(e) {
+  if (!isDragging) return;
+
+  const dx = e.clientX - previousMouse.x;
+  const dy = e.clientY - previousMouse.y;
+
+  rotationVelocity.y = dx * 0.005;
+  rotationVelocity.x = dy * 0.005;
+
+  earth.rotation.y += rotationVelocity.y;
+  earth.rotation.x += rotationVelocity.x;
+  clouds.rotation.y += rotationVelocity.y;
+  clouds.rotation.x += rotationVelocity.x;
+
+  previousMouse = { x: e.clientX, y: e.clientY };
+}
+
+function onMouseUp() {
+  isDragging = false;
+}
+
+function onWheel(e) {
+  e.preventDefault();
+  targetZoom *= e.deltaY > 0 ? 1.1 : 0.9;
+  targetZoom = Math.max(1.2, Math.min(8, targetZoom));
+}
+
+function onDoubleClick() {
+  targetZoom = targetZoom > 3 ? 1.5 : 5;
+}
+
+// Touch
+let touchStartDist = 0;
+function onTouchStart(e) {
+  if (e.touches.length === 1) {
+    isDragging = true;
+    previousMouse = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+  } else if (e.touches.length === 2) {
+    const dx = e.touches[0].clientX - e.touches[1].clientX;
+    const dy = e.touches[0].clientY - e.touches[1].clientY;
+    touchStartDist = Math.sqrt(dx * dx + dy * dy);
+  }
+}
+
+function onTouchMove(e) {
+  e.preventDefault();
+  if (e.touches.length === 1 && isDragging) {
+    const dx = e.touches[0].clientX - previousMouse.x;
+    const dy = e.touches[0].clientY - previousMouse.y;
+    earth.rotation.y += dx * 0.005;
+    earth.rotation.x += dy * 0.005;
+    clouds.rotation.y += dx * 0.005;
+    clouds.rotation.x += dy * 0.005;
+    previousMouse = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+  } else if (e.touches.length === 2) {
+    const dx = e.touches[0].clientX - e.touches[1].clientX;
+    const dy = e.touches[0].clientY - e.touches[1].clientY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (touchStartDist > 0) {
+      targetZoom *= touchStartDist / dist;
+      targetZoom = Math.max(1.2, Math.min(8, targetZoom));
+    }
+    touchStartDist = dist;
+  }
+}
+
+function onTouchEnd() {
+  isDragging = false;
+  touchStartDist = 0;
+}
+
+function onResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+// ============================================================
+// ОПРЕДЕЛЕНИЕ ШИРОТЫ/ДОЛГОТЫ ПОД МЫШЬЮ
+// ============================================================
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+window.addEventListener('mousemove', e => {
+  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+  const intersects = raycaster.intersectObject(earth);
+
+  if (intersects.length > 0) {
+    const point = intersects[0].point.clone();
+    // Переводим точку в локальные координаты Земли
+    earth.worldToLocal(point);
+    point.normalize();
+
+    const lat = 90 - Math.acos(point.y) * 180 / Math.PI;
+    let lon = Math.atan2(point.z, -point.x) * 180 / Math.PI;
+    // Корректируем на поворот Земли
+    lon += (earth.rotation.y * 180 / Math.PI) % 360;
+    while (lon > 180) lon -= 360;
+    while (lon < -180) lon += 360;
+
+    latEl.textContent = lat.toFixed(2) + '°';
+    lonEl.textContent = lon.toFixed(2) + '°';
+  }
+});
+
+// ============================================================
+// АНИМАЦИЯ
+// ============================================================
+function animate() {
+  requestAnimationFrame(animate);
+
+  // Инерция вращения
+  if (!isDragging) {
+    earth.rotation.y += rotationVelocity.y * 0.95;
+    earth.rotation.x += rotationVelocity.x * 0.95;
+    clouds.rotation.y += rotationVelocity.y * 0.95;
+    clouds.rotation.x += rotationVelocity.x * 0.95;
+    rotationVelocity.y *= 0.95;
+    rotationVelocity.x *= 0.95;
+
+    // Авто-вращение (медленное)
+    if (Math.abs(rotationVelocity.y) < 0.0005) {
+      earth.rotation.y += 0.0008;
+      clouds.rotation.y += 0.0008;
+    }
+  }
+
+  // Ограничение наклона
+  earth.rotation.x = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, earth.rotation.x));
+  clouds.rotation.x = earth.rotation.x;
+
+  // Облака чуть быстрее Земли (эффект движения)
+  if (!isDragging) {
+    clouds.rotation.y += 0.0002;
+  }
+
+  // Плавный зум
+  currentZoom += (targetZoom - currentZoom) * 0.1;
+  camera.position.z = currentZoom;
+  zoomEl.textContent = currentZoom.toFixed(2);
+
+  // Звёзды медленно вращаются
+  if (starField) {
+    starField.rotation.y += 0.00005;
+  }
+
+  // Свет движется (день/ночь)
+  const t = Date.now() * 0.00005;
+  sunLight.position.x = Math.cos(t) * 5;
+  sunLight.position.z = Math.sin(t) * 5;
+  sunLight.position.y = Math.sin(t * 0.5) * 2;
+
+  // Часы
+  const now = new Date();
+  clockEl.textContent = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+
+  renderer.render(scene, camera);
+}
+
+// ============================================================
+// СТАРТ
+// ============================================================
+init();
+</script>
+</body>
+</html>
